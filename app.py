@@ -6,27 +6,12 @@ from flask_socketio import SocketIO
 import subprocess
 import yaml
 import time
+import socket
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode='eventlet')
-
-TARGETS_CACHE = {
-    "data": [],
-    "last_loaded": 0,
-    "reload_interval": 5  # seconds
-}
-
-def load_targets():
-    with open("targets.yaml") as f:
-        return yaml.safe_load(f)
-
-def get_targets():
-    now = time.time()
-    if now - TARGETS_CACHE["last_loaded"] > TARGETS_CACHE["reload_interval"]:
-        print(">>> Reloading targets.yaml")
-        TARGETS_CACHE["data"] = load_targets()
-        TARGETS_CACHE["last_loaded"] = now
-    return TARGETS_CACHE["data"]
 
 def ping(host):
     try:
@@ -38,15 +23,54 @@ def ping(host):
         print(f"Ping error for {host}: {e}")
         return False
 
+def tcp_check(host, port, timeout=1):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception as e:
+        print(f"TCP error for {host}:{port} -> {e}")
+        return False
+
+def check_target(target):
+    method = target.get("check", "ping")
+    host = target["host"]
+    label = target["label"]
+
+    if method == "ping":
+        result = ping(host)
+    elif method == "tcp":
+        port = int(target.get("port", 80))
+        result = tcp_check(host, port)
+    else:
+        print(f"Unknown check type for {label}: {method}")
+        result = False
+
+    return {"label": label, "status": "up" if result else "down"}
+
 def get_ping_results():
-    targets = get_targets()
-    return [
-        {
-            "label": target["label"],
-            "status": "up" if ping(target["host"]) else "down"
-        }
-        for target in targets
-    ]
+    print(">>> Reloading targets.yaml")
+    try:
+        fd = os.open("targets.yaml", os.O_RDONLY)
+        with os.fdopen(fd) as f:
+            targets = yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading targets.yaml: {e}")
+        return []
+
+    result_map = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_label = {executor.submit(check_target, t): t["label"] for t in targets}
+        for future in as_completed(future_to_label, timeout=5):
+            label = future_to_label[future]
+            try:
+                result = future.result(timeout=1.5)
+            except Exception as e:
+                print(f"Timeout/error checking {label}: {e}")
+                result = {"label": label, "status": "down"}
+            result_map[label] = result
+
+    # Return results in original order
+    return [result_map.get(t["label"], {"label": t["label"], "status": "down"}) for t in targets]
 
 @app.route("/")
 def index():
@@ -57,7 +81,7 @@ def background_ping_loop():
     while True:
         results = get_ping_results()
         print(">>> Emitting results via WebSocket:", results)
-        socketio.emit('ping_update', results, namespace='/')  # <- final fix
+        socketio.emit('ping_update', results, namespace='/')
         time.sleep(2)
 
 if __name__ == "__main__":

@@ -1,8 +1,17 @@
 - label: Google DNS
   host: 8.8.8.8
+  check: ping
 
-- label: Cloudflare
+- label: HTTP on Cloudflare
   host: 1.1.1.1
+  check: tcp
+  port: 80
 
 - label: My Router
   host: 192.168.1.1
+  check: ping
+
+- label: SSH on DevBox
+  host: 192.168.50.10
+  check: tcp
+  port: 22
